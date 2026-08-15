@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/ejoffe/rake"
 	"github.com/ejoffe/spr/config"
@@ -23,12 +25,57 @@ var (
 	date    = "unknown"
 )
 
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
 func init() {
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	log.Logger = log.With().Caller().Logger().Output(zerolog.ConsoleWriter{Out: os.Stderr})
 }
 
+// handleEditSequence is an internal command used as a git sequence editor.
+// It rewrites 'pick <hash>' to 'edit <hash>' for a target commit in the rebase todo file.
+// Usage: spr _edit-sequence <commit-hash-prefix> <todo-file>
+func handleEditSequence() {
+	if len(os.Args) < 4 || os.Args[1] != "_edit-sequence" {
+		return
+	}
+	hashPrefix := os.Args[2]
+	todoFile := os.Args[3]
+
+	data, err := os.ReadFile(todoFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error reading todo file: %s\n", err)
+		os.Exit(1)
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	var lines []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "pick "+hashPrefix) {
+			line = strings.Replace(line, "pick ", "edit ", 1)
+		}
+		lines = append(lines, line)
+	}
+
+	err = os.WriteFile(todoFile, []byte(strings.Join(lines, "\n")+"\n"), 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error writing todo file: %s\n", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
 func main() {
+	// Handle internal _edit-sequence command before any git/config initialization.
+	// This is invoked by git as a sequence editor during 'spr edit'.
+	handleEditSequence()
+
 	gitcmd := realgit.NewGitCmd(config.DefaultConfig())
 	//  check that we are inside a git dir
 	var output string
@@ -58,6 +105,13 @@ func main() {
 		Usage: "Show detailed status bits output",
 	}
 
+	textFlag := &cli.BoolFlag{
+		Name:    "text",
+		Aliases: []string{"t"},
+		Value:   false,
+		Usage:   "Show plain text output (URL : title)",
+	}
+
 	cli.AppHelpTemplate = `NAME:
    {{.Name}} - {{.Usage}}
 
@@ -77,7 +131,7 @@ VERSION: fork of {{.Version}}
 		Name:                 "spr",
 		Usage:                "Stacked Pull Requests on GitHub",
 		HideVersion:          true,
-		Version:              fmt.Sprintf("%s : %s : %s\n", version, date, commit[:8]),
+		Version:              fmt.Sprintf("%s : %s : %s\n", version, date, truncate(commit, 8)),
 		EnableBashCompletion: true,
 		Authors: []*cli.Author{
 			{
@@ -130,12 +184,16 @@ VERSION: fork of {{.Version}}
 				Name:    "status",
 				Aliases: []string{"s", "st"},
 				Usage:   "Show status of open pull requests",
-				Action: func(c *cli.Context) error {
-					stackedpr.StatusPullRequests(ctx)
-					return nil
-				},
+			Action: func(c *cli.Context) error {
+				if c.IsSet("text") {
+					stackedpr.TextEnabled = true
+				}
+				stackedpr.StatusPullRequests(ctx)
+				return nil
+			},
 				Flags: []cli.Flag{
 					detailFlag,
+					textFlag,
 				},
 			},
 			{
@@ -150,10 +208,23 @@ VERSION: fork of {{.Version}}
 				Name:    "update",
 				Aliases: []string{"u", "up"},
 				Usage:   "Update and create pull requests for updated commits in the stack",
+			Before: func(c *cli.Context) error {
+				// only override whatever was set in yaml if flag is explicitly present
+				if c.IsSet("no-rebase") {
+					cfg.User.NoRebase = c.Bool("no-rebase")
+				}
+				if c.IsSet("fetch") && c.IsSet("no-fetch") {
+					return fmt.Errorf("cannot use both --fetch and --no-fetch")
+				}
+				if c.IsSet("fetch") {
+					cfg.User.NoFetch = !c.Bool("fetch")
+				}
+				if c.IsSet("no-fetch") {
+					cfg.User.NoFetch = c.Bool("no-fetch")
+				}
+				return nil
+			},
 				Action: func(c *cli.Context) error {
-					if c.Bool("no-rebase") {
-						os.Setenv("SPR_NOREBASE", "true")
-					}
 					if c.IsSet("count") {
 						count := c.Uint("count")
 						stackedpr.UpdatePullRequests(ctx, c.StringSlice("reviewer"), &count)
@@ -174,11 +245,26 @@ VERSION: fork of {{.Version}}
 						Aliases: []string{"c"},
 						Usage:   "Update a specified number of pull requests from the bottom of the stack",
 					},
-					&cli.BoolFlag{
-						Name:    "no-rebase",
-						Aliases: []string{"nr"},
-						Usage:   "Disable rebasing",
-					},
+				&cli.BoolFlag{
+					Name:    "no-rebase",
+					Aliases: []string{"nr"},
+					Usage:   "Disable rebasing",
+					// this env var is needed as previous versions used the env var itself to pass intent to logic
+					// layer ops so it is likely relied on as a feature by users at this point
+					EnvVars: []string{"SPR_NOREBASE"},
+				},
+			&cli.BoolFlag{
+				Name:    "fetch",
+				Aliases: []string{"f"},
+				Usage:   "Enable fetch (overrides noFetch config)",
+				EnvVars: []string{"SPR_FETCH"},
+			},
+			&cli.BoolFlag{
+				Name:    "no-fetch",
+				Aliases: []string{"nf"},
+				Usage:   "Disable fetch",
+				EnvVars: []string{"SPR_NOFETCH"},
+			},
 				},
 			},
 			{
@@ -202,14 +288,64 @@ VERSION: fork of {{.Version}}
 					},
 				},
 			},
-			{
-				Name:  "check",
-				Usage: "Run pre merge checks (configured by MergeCheck in repository config)",
-				Action: func(c *cli.Context) error {
-					stackedpr.RunMergeCheck(ctx)
-					return nil
+		{
+			Name:    "amend",
+			Aliases: []string{"a"},
+			Usage:   "Amend a commit in the stack",
+			Flags: []cli.Flag{
+				&cli.BoolFlag{
+					Name:    "update",
+					Aliases: []string{"u"},
+					Usage:   "Run spr update after amend",
 				},
 			},
+			Action: func(c *cli.Context) error {
+				stackedpr.AmendCommit(ctx)
+				if c.Bool("update") {
+					stackedpr.UpdatePullRequests(ctx, nil, nil)
+				}
+				return nil
+			},
+		},
+		{
+			Name:    "edit",
+			Aliases: []string{"e"},
+			Usage:   "Edit a commit in the stack",
+			Flags: []cli.Flag{
+				&cli.BoolFlag{
+					Name:    "done",
+					Aliases: []string{"d"},
+					Usage:   "Finish editing and restore the stack",
+				},
+				&cli.BoolFlag{
+					Name:    "update",
+					Aliases: []string{"u"},
+					Usage:   "Run spr update after finishing edit (use with --done)",
+				},
+				&cli.BoolFlag{
+					Name:  "abort",
+					Usage: "Abort the current edit session",
+				},
+			},
+			Action: func(c *cli.Context) error {
+				if c.Bool("abort") {
+					stackedpr.EditCommitAbort(ctx)
+				} else if c.Bool("done") {
+					stackedpr.EditCommitDone(ctx, c.Bool("update"))
+				} else {
+					stackedpr.EditCommit(ctx)
+				}
+				return nil
+			},
+		},
+		{
+			Name:  "check",
+			Usage: "Run pre merge checks (configured by MergeCheck in repository config)",
+			Action: func(c *cli.Context) error {
+				stackedpr.RunMergeCheck(ctx)
+				return nil
+			},
+		},
 			{
 				Name:  "version",
 				Usage: "Show version info",

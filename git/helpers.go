@@ -26,10 +26,13 @@ func GetLocalBranchName(gitcmd GitInterface) string {
 
 func BranchNameFromCommit(cfg *config.Config, commit Commit) string {
 	remoteBranchName := cfg.Repo.GitHubBranch
-	return "spr/" + remoteBranchName + "/" + commit.CommitID
+	branchPrefix := cfg.User.BranchPrefix
+	return branchPrefix + "/" + remoteBranchName + "/" + commit.CommitID
 }
 
-var BranchNameRegex = regexp.MustCompile(`spr/([a-zA-Z0-9_\-/\.]+)/([a-f0-9]{8})$`)
+func BranchNameRegex(branchPrefix string) *regexp.Regexp {
+	return regexp.MustCompile(regexp.QuoteMeta(branchPrefix) + `/([a-zA-Z0-9_\-/\.]+)/([a-f0-9]{8})$`)
+}
 
 // GetLocalTopCommit returns the top unmerged commit in the stack
 //
@@ -40,12 +43,6 @@ func GetLocalTopCommit(cfg *config.Config, gitcmd GitInterface) *Commit {
 		return nil
 	}
 	return &commits[len(commits)-1]
-}
-
-func DeleteRemoteBranch(cfg *config.Config, gitcmd GitInterface, branchName string) {
-	command := fmt.Sprintf("push origin --delete %s", branchName)
-	err := gitcmd.Git(command, nil)
-	check(err)
 }
 
 // GetLocalCommitStack returns a list of unmerged commits
@@ -81,7 +78,7 @@ func parseLocalCommitStack(commitLog string) ([]Commit, bool) {
 	var commits []Commit
 
 	commitHashRegex := regexp.MustCompile(`^commit ([a-f0-9]{40})`)
-	commitIDRegex := regexp.MustCompile(`commit-id\:([a-f0-9]{8})`)
+	commitIDRegex := regexp.MustCompile(`commit-id\:\s*([a-f0-9]{8})`)
 
 	// The list of commits from the command line actually starts at the
 	//  most recent commit. In order to reverse the list we use a

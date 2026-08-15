@@ -25,7 +25,7 @@ func TestMergable(t *testing.T) {
 		}
 	}
 
-	pr := func(checks checkStatus, approved bool, noConflics bool, stacked bool) *PullRequest {
+	pr := func(checks CheckStatus, approved bool, noConflics bool, stacked bool) *PullRequest {
 		return &PullRequest{
 			MergeStatus: PullRequestMergeStatus{
 				ChecksPass:     checks,
@@ -69,7 +69,7 @@ func TestReady(t *testing.T) {
 		}
 	}
 
-	pr := func(checks checkStatus, wip bool, approved bool, noConflics bool, stacked bool) *PullRequest {
+	pr := func(checks CheckStatus, wip bool, approved bool, noConflics bool, stacked bool) *PullRequest {
 		return &PullRequest{
 			MergeStatus: PullRequestMergeStatus{
 				ChecksPass:     checks,
@@ -117,7 +117,7 @@ func TestStatusString(t *testing.T) {
 		}
 	}
 
-	pr := func(checks checkStatus, approved bool, noConflics bool, stacked bool) *PullRequest {
+	pr := func(checks CheckStatus, approved bool, noConflics bool, stacked bool) *PullRequest {
 		return &PullRequest{
 			MergeStatus: PullRequestMergeStatus{
 				ChecksPass:     checks,
@@ -170,12 +170,97 @@ func TestString(t *testing.T) {
 		}
 	}
 
+	cfgWithShowPRLink := &config.Config{
+		Repo: &config.RepoConfig{
+			RequireChecks:   true,
+			RequireApproval: true,
+			GitHubHost:      "github.com",
+			GitHubRepoOwner: "testowner",
+			GitHubRepoName:  "testrepo",
+		},
+		User: &config.UserConfig{
+			StatusBitsEmojis: false,
+			ShowPRLink:       true,
+		},
+	}
+
+	cfgWithShortPRLink := &config.Config{
+		Repo: &config.RepoConfig{
+			RequireChecks:   true,
+			RequireApproval: true,
+			GitHubHost:      "github.com",
+			GitHubRepoOwner: "testowner",
+			GitHubRepoName:  "testrepo",
+		},
+		User: &config.UserConfig{
+			StatusBitsEmojis: false,
+			ShortPRLink:      true,
+		},
+	}
+
+	cfgWithCommitID := &config.Config{
+		Repo: &config.RepoConfig{
+			RequireChecks:   true,
+			RequireApproval: true,
+		},
+		User: &config.UserConfig{
+			StatusBitsEmojis: false,
+			ShowCommitID:     true,
+		},
+	}
+
+	prWithHash := func(inQueue bool, commits int, hash string, localHash string) *PullRequest {
+		return &PullRequest{
+			InQueue:         inQueue,
+			Commits:         make([]git.Commit, commits),
+			Title:           "Title",
+			Commit:          git.Commit{CommitHash: hash},
+			LocalCommitHash: localHash,
+			MergeStatus:     PullRequestMergeStatus{},
+		}
+	}
+
 	tests := []testcase{
 		{expect: "[?xxx] .   0 : Title", pr: pr(true, 1), cfg: cfg},
 		{expect: "[?xxx] .   0 : Title", pr: pr(true, 2), cfg: cfg},
 		{expect: "[?xxx] !   0 : Title", pr: pr(false, 2), cfg: cfg},
+		// ShowPRLink: full URL is displayed
+		{expect: "[?xxx] . https://github.com/testowner/testrepo/pull/0 : Title", pr: pr(true, 1), cfg: cfgWithShowPRLink},
+		// ShortPRLink: clickable short link via OSC 8
+		{expect: "[?xxx] . \033]8;;https://github.com/testowner/testrepo/pull/0\033\\PR-0\033]8;;\033\\ : Title", pr: pr(true, 1), cfg: cfgWithShortPRLink},
+		// ShowCommitID: falls back to Commit.CommitHash when LocalCommitHash is empty
+		{expect: "[?xxx] . abcd1234   0 : Title", pr: prWithHash(true, 1, "abcd1234ef567890", ""), cfg: cfgWithCommitID},
+		// ShowCommitID: LocalCommitHash takes precedence over Commit.CommitHash
+		{expect: "[?xxx] . 11112222   0 : Title", pr: prWithHash(true, 1, "abcd1234ef567890", "1111222233334444"), cfg: cfgWithCommitID},
+		// ShowCommitID with short hash (< 8 chars): full hash shown
+		{expect: "[?xxx] . abcd   0 : Title", pr: prWithHash(true, 1, "abcd", ""), cfg: cfgWithCommitID},
+		// ShowCommitID with empty hash: no hash shown
+		{expect: "[?xxx] .   0 : Title", pr: prWithHash(true, 1, "", ""), cfg: cfgWithCommitID},
 	}
 	for i, test := range tests {
 		assert.Equal(t, test.expect, test.pr.String(test.cfg), fmt.Sprintf("case %d failed", i))
 	}
+}
+
+func TestTextString(t *testing.T) {
+	cfg := &config.Config{
+		Repo: &config.RepoConfig{
+			GitHubHost:      "github.com",
+			GitHubRepoOwner: "testowner",
+			GitHubRepoName:  "testrepo",
+		},
+		User: &config.UserConfig{},
+	}
+
+	pr := &PullRequest{
+		Number: 42,
+		Title:  "Add new feature",
+	}
+	assert.Equal(t, "https://github.com/testowner/testrepo/pull/42 : Add new feature", pr.TextString(cfg))
+
+	pr2 := &PullRequest{
+		Number: 7,
+		Title:  "Fix bug in parser",
+	}
+	assert.Equal(t, "https://github.com/testowner/testrepo/pull/7 : Fix bug in parser", pr2.TextString(cfg))
 }

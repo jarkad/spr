@@ -3,11 +3,12 @@ package githubclient
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
-	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -17,7 +18,9 @@ import (
 	"github.com/ejoffe/spr/github"
 	"github.com/ejoffe/spr/github/githubclient/fezzik_types"
 	"github.com/ejoffe/spr/github/githubclient/gen/genclient"
+	"github.com/ejoffe/spr/github/template/config_fetcher"
 	"github.com/rs/zerolog/log"
+	"github.com/zalando/go-keyring"
 	"golang.org/x/oauth2"
 )
 
@@ -91,7 +94,11 @@ func findToken(githubHost string) string {
 	} else {
 		for host, user := range *cfg {
 			if host == githubHost {
-				return user.OauthToken
+				secret, err := keyring.Get("gh:github.com", user.User)
+				if err != nil {
+					return user.OauthToken
+				}
+				return secret
 			}
 		}
 	}
@@ -148,8 +155,9 @@ func NewGitHubClient(ctx context.Context, config *config.Config) *client {
 	tc := oauth2.NewClient(ctx, ts)
 
 	var api genclient.Client
+	var endpoint string
 	if strings.HasSuffix(config.Repo.GitHubHost, "github.com") {
-		api = genclient.NewClient("https://api.github.com/graphql", tc)
+		endpoint = "https://api.github.com/graphql"
 	} else {
 		var scheme, host string
 		gitHubRemoteUrl, err := url.Parse(config.Repo.GitHubHost)
@@ -161,17 +169,22 @@ func NewGitHubClient(ctx context.Context, config *config.Config) *client {
 			host = gitHubRemoteUrl.Host
 			scheme = gitHubRemoteUrl.Scheme
 		}
-		api = genclient.NewClient(fmt.Sprintf("%s://%s/api/graphql", scheme, host), tc)
+		endpoint = fmt.Sprintf("%s://%s/api/graphql", scheme, host)
 	}
+	api = genclient.NewClient(endpoint, tc)
 	return &client{
-		config: config,
-		api:    api,
+		config:          config,
+		api:             api,
+		graphqlEndpoint: endpoint,
+		httpClient:      tc,
 	}
 }
 
 type client struct {
-	config *config.Config
-	api    genclient.Client
+	config          *config.Config
+	api             genclient.Client
+	graphqlEndpoint string
+	httpClient      *http.Client
 }
 
 func (c *client) GetInfo(ctx context.Context, gitcmd git.GitInterface) *github.GitHubInfo {
@@ -203,7 +216,23 @@ func (c *client) GetInfo(ctx context.Context, gitcmd git.GitInterface) *github.G
 	targetBranch := c.config.Repo.GitHubBranch
 	localCommitStack := git.GetLocalCommitStack(c.config, gitcmd)
 
-	pullRequests := matchPullRequestStack(c.config.Repo, targetBranch, localCommitStack, pullRequestConnection)
+	pullRequests := matchPullRequestStack(c.config.Repo, c.config.User.BranchPrefix, targetBranch, localCommitStack, pullRequestConnection)
+
+	// When RequiredChecks is explicitly configured, fetch individual check contexts
+	// and only evaluate the listed checks. This allows non-required check failures
+	// to be ignored. When RequiredChecks is not set, the statusCheckRollup.state
+	// from the fezzik query is used as-is (all checks matter).
+	if c.config.Repo.RequireChecks && len(c.config.Repo.RequiredChecks) > 0 && len(pullRequests) > 0 {
+		requiredStatus := c.fetchRequiredChecksStatus(ctx, pullRequests)
+		if requiredStatus != nil {
+			for _, pr := range pullRequests {
+				if status, ok := requiredStatus[pr.Number]; ok {
+					pr.MergeStatus.ChecksPass = status
+				}
+			}
+		}
+	}
+
 	for _, pr := range pullRequests {
 		if pr.Ready(c.config) {
 			pr.MergeStatus.Stacked = true
@@ -225,6 +254,7 @@ func (c *client) GetInfo(ctx context.Context, gitcmd git.GitInterface) *github.G
 
 func matchPullRequestStack(
 	repoConfig *config.RepoConfig,
+	branchPrefix string,
 	targetBranch string,
 	localCommitStack []git.Commit,
 	allPullRequests fezzik_types.PullRequestConnection) []*github.PullRequest {
@@ -261,7 +291,7 @@ func matchPullRequestStack(
 			InQueue:    node.MergeQueueEntry != nil,
 		}
 
-		matches := git.BranchNameRegex.FindStringSubmatch(node.HeadRefName)
+		matches := git.BranchNameRegex(branchPrefix).FindStringSubmatch(node.HeadRefName)
 		if matches != nil {
 			commit := (*node.Commits.Nodes)[len(*node.Commits.Nodes)-1].Commit
 			pullRequest.Commit = git.Commit{
@@ -290,6 +320,14 @@ func matchPullRequestStack(
 			}
 
 			pullRequestMap[pullRequest.Commit.CommitID] = pullRequest
+		}
+	}
+
+	// store local commit hashes on PRs for display purposes
+	//  (the remote CommitHash is preserved for update detection in syncCommitStackToGitHub)
+	for _, c := range localCommitStack {
+		if pr, ok := pullRequestMap[c.CommitID]; ok && c.CommitHash != "" {
+			pr.LocalCommitHash = c.CommitHash
 		}
 	}
 
@@ -322,7 +360,7 @@ func matchPullRequestStack(
 			break
 		}
 
-		matches := git.BranchNameRegex.FindStringSubmatch(currpr.ToBranch)
+		matches := git.BranchNameRegex(branchPrefix).FindStringSubmatch(currpr.ToBranch)
 		if matches == nil {
 			panic(fmt.Errorf("invalid base branch for pull request:%s", currpr.ToBranch))
 		}
@@ -384,22 +422,14 @@ func (c *client) CreatePullRequest(ctx context.Context, gitcmd git.GitInterface,
 		Str("FromBranch", headRefName).Str("ToBranch", baseRefName).
 		Msg("CreatePullRequest")
 
-	body := formatBody(commit, info.PullRequests, c.config.Repo.ShowPrTitlesInStack)
-	if c.config.Repo.PRTemplatePath != "" {
-		pullRequestTemplate, err := readPRTemplate(gitcmd, c.config.Repo.PRTemplatePath)
-		if err != nil {
-			log.Fatal().Err(err).Msg("failed to read PR template")
-		}
-		body, err = insertBodyIntoPRTemplate(body, pullRequestTemplate, c.config.Repo, nil)
-		if err != nil {
-			log.Fatal().Err(err).Msg("failed to insert body into PR template")
-		}
-	}
+	templatizer := config_fetcher.PRTemplatizer(c.config, gitcmd)
+
+	body := templatizer.Body(info, commit, nil)
 	resp, err := c.api.CreatePullRequest(ctx, genclient.CreatePullRequestInput{
 		RepositoryId: info.RepositoryID,
 		BaseRefName:  baseRefName,
 		HeadRefName:  headRefName,
-		Title:        commit.Subject,
+		Title:        templatizer.Title(info, commit),
 		Body:         &body,
 		Draft:        &c.config.User.CreateDraftPRs,
 	})
@@ -412,6 +442,7 @@ func (c *client) CreatePullRequest(ctx context.Context, gitcmd git.GitInterface,
 		ToBranch:   baseRefName,
 		Commit:     commit,
 		Title:      commit.Subject,
+		Body:       resp.CreatePullRequest.PullRequest.Body,
 		MergeStatus: github.PullRequestMergeStatus{
 			ChecksPass:     github.CheckStatusUnknown,
 			ReviewApproved: false,
@@ -427,117 +458,9 @@ func (c *client) CreatePullRequest(ctx context.Context, gitcmd git.GitInterface,
 	return pr
 }
 
-func formatStackMarkdown(commit git.Commit, stack []*github.PullRequest, showPrTitlesInStack bool) string {
-	var buf bytes.Buffer
-	for i := len(stack) - 1; i >= 0; i-- {
-		isCurrent := stack[i].Commit == commit
-		var suffix string
-		if isCurrent {
-			suffix = " ⬅"
-		} else {
-			suffix = ""
-		}
-		var prTitle string
-		if showPrTitlesInStack {
-			prTitle = fmt.Sprintf("%s ", stack[i].Title)
-		} else {
-			prTitle = ""
-		}
-
-		buf.WriteString(fmt.Sprintf("- %s#%d%s\n", prTitle, stack[i].Number, suffix))
-	}
-
-	return buf.String()
-}
-
-func formatBody(commit git.Commit, stack []*github.PullRequest, showPrTitlesInStack bool) string {
-	if len(stack) <= 1 {
-		return strings.TrimSpace(commit.Body)
-	}
-
-	if commit.Body == "" {
-		return fmt.Sprintf("**Stack**:\n%s",
-			addManualMergeNotice(formatStackMarkdown(commit, stack, showPrTitlesInStack)))
-	}
-
-	return fmt.Sprintf("%s\n\n---\n\n**Stack**:\n%s",
-		commit.Body,
-		addManualMergeNotice(formatStackMarkdown(commit, stack, showPrTitlesInStack)))
-}
-
-// Reads the specified PR template file and returns it as a string
-func readPRTemplate(gitcmd git.GitInterface, templatePath string) (string, error) {
-	repoRootDir := gitcmd.RootDir()
-	fullTemplatePath := filepath.Clean(path.Join(repoRootDir, templatePath))
-	pullRequestTemplateBytes, err := os.ReadFile(fullTemplatePath)
-	if err != nil {
-		return "", fmt.Errorf("%w: unable to read template %v", err, fullTemplatePath)
-	}
-	return string(pullRequestTemplateBytes), nil
-}
-
-// insertBodyIntoPRTemplate inserts a text body into the given PR template and returns the result as a string.
-// It uses the PRTemplateInsertStart and PRTemplateInsertEnd values defined in RepoConfig to determine where the body
-// should be inserted in the PR template. If there are issues finding the correct place to insert the body
-// an error will be returned.
-//
-// NOTE: on PR update, rather than using the PR template, it will use the existing PR body, which should have
-// the PR template from the initial PR create.
-func insertBodyIntoPRTemplate(body, prTemplate string, repo *config.RepoConfig, pr *github.PullRequest) (string, error) {
-	templateOrExistingPRBody := prTemplate
-	if pr != nil && pr.Body != "" {
-		templateOrExistingPRBody = pr.Body
-	}
-
-	startPRTemplateSection, err := getSectionOfPRTemplate(templateOrExistingPRBody, repo.PRTemplateInsertStart, BeforeMatch)
-	if err != nil {
-		return "", fmt.Errorf("%w: PR template insert start = '%v'", err, repo.PRTemplateInsertStart)
-	}
-
-	endPRTemplateSection, err := getSectionOfPRTemplate(templateOrExistingPRBody, repo.PRTemplateInsertEnd, AfterMatch)
-	if err != nil {
-		return "", fmt.Errorf("%w: PR template insert end = '%v'", err, repo.PRTemplateInsertStart)
-	}
-
-	return fmt.Sprintf("%v%v\n%v\n\n%v%v", startPRTemplateSection, repo.PRTemplateInsertStart, body,
-		repo.PRTemplateInsertEnd, endPRTemplateSection), nil
-}
-
-const (
-	BeforeMatch = iota
-	AfterMatch
-)
-
-// getSectionOfPRTemplate searches text for a matching searchString and will return the text before or after the
-// match as a string. If there are no matches or more than one match is found, an error will be returned.
-func getSectionOfPRTemplate(text, searchString string, returnMatch int) (string, error) {
-	split := strings.Split(text, searchString)
-	switch len(split) {
-	case 2:
-		if returnMatch == BeforeMatch {
-			return split[0], nil
-		} else if returnMatch == AfterMatch {
-			return split[1], nil
-		}
-		return "", fmt.Errorf("invalid enum value")
-	case 1:
-		return "", fmt.Errorf("no matches found")
-	default:
-		return "", fmt.Errorf("multiple matches found")
-	}
-}
-
-func addManualMergeNotice(body string) string {
-	return body + "\n\n" +
-		"⚠️ *Part of a stack created by [spr](https://github.com/ejoffe/spr). " +
-		"Do not merge manually using the UI - doing so may have unexpected results.*"
-}
-
-func (c *client) UpdatePullRequest(ctx context.Context, gitcmd git.GitInterface, pullRequests []*github.PullRequest, pr *github.PullRequest, commit git.Commit, prevCommit *git.Commit) {
-
-	if c.config.User.LogGitHubCalls {
-		fmt.Printf("> github update %d : %s\n", pr.Number, pr.Title)
-	}
+func (c *client) UpdatePullRequest(ctx context.Context, gitcmd git.GitInterface,
+	info *github.GitHubInfo, pullRequests []*github.PullRequest, pr *github.PullRequest,
+	commit git.Commit, prevCommit *git.Commit) {
 
 	baseRefName := c.config.Repo.GitHubBranch
 	if prevCommit != nil {
@@ -548,32 +471,41 @@ func (c *client) UpdatePullRequest(ctx context.Context, gitcmd git.GitInterface,
 		Str("FromBranch", pr.FromBranch).Str("ToBranch", baseRefName).
 		Interface("PR", pr).Msg("UpdatePullRequest")
 
-	body := formatBody(commit, pullRequests, c.config.Repo.ShowPrTitlesInStack)
-	if c.config.Repo.PRTemplatePath != "" {
-		pullRequestTemplate, err := readPRTemplate(gitcmd, c.config.Repo.PRTemplatePath)
-		if err != nil {
-			log.Fatal().Err(err).Msg("failed to read PR template")
+	templatizer := config_fetcher.PRTemplatizer(c.config, gitcmd)
+	title := templatizer.Title(info, commit)
+	body := templatizer.Body(info, commit, pr)
+
+	// Skip the API call if nothing has actually changed. This avoids
+	// triggering a spurious pull_request "edited" event on GitHub which
+	// would cause a second (duplicate) Actions run after the force-push
+	// already triggered a "synchronize" event.
+	titleUnchanged := c.config.User.PreserveTitleAndBody || title == pr.Title
+	bodyUnchanged := c.config.User.PreserveTitleAndBody || body == pr.Body
+	baseUnchanged := pr.InQueue || baseRefName == pr.ToBranch
+	if titleUnchanged && bodyUnchanged && baseUnchanged {
+		log.Debug().Int("number", pr.Number).Msg("UpdatePullRequest: skipping, nothing changed")
+		if c.config.User.LogGitHubCalls {
+			fmt.Printf("> github update %d : %s (skipped, no changes)\n", pr.Number, pr.Title)
 		}
-		body, err = insertBodyIntoPRTemplate(body, pullRequestTemplate, c.config.Repo, pr)
-		if err != nil {
-			log.Fatal().Err(err).Msg("failed to insert body into PR template")
-		}
+		return
 	}
-	title := &commit.Subject
+
+	if c.config.User.LogGitHubCalls {
+		fmt.Printf("> github update %d : %s\n", pr.Number, pr.Title)
+	}
 
 	input := genclient.UpdatePullRequestInput{
 		PullRequestId: pr.ID,
-		Title:         title,
+		Title:         &title,
 		Body:          &body,
+	}
+	if c.config.User.PreserveTitleAndBody {
+		input.Title = nil
+		input.Body = nil
 	}
 
 	if !pr.InQueue {
 		input.BaseRefName = &baseRefName
-	}
-
-	if c.config.User.PreserveTitleAndBody {
-		input.Title = nil
-		input.Body = nil
 	}
 
 	_, err := c.api.UpdatePullRequest(ctx, input)
@@ -683,6 +615,231 @@ func (c *client) ClosePullRequest(ctx context.Context, pr *github.PullRequest) {
 	if c.config.User.LogGitHubCalls {
 		fmt.Printf("> github close %d : %s\n", pr.Number, pr.Title)
 	}
+}
+
+// Response types for the raw GraphQL query that fetches individual check contexts.
+// These are used instead of fezzik-generated types because fezzik does not support
+// inline fragments on union types (StatusCheckRollupContext = CheckRun | StatusContext).
+
+type checkContextNode struct {
+	TypeName   string  `json:"__typename"`
+	Name       string  `json:"name"`       // CheckRun
+	Conclusion *string `json:"conclusion"` // CheckRun (nil when not completed)
+	Status     string  `json:"status"`     // CheckRun: COMPLETED, IN_PROGRESS, QUEUED, etc.
+	Context    string  `json:"context"`    // StatusContext
+	State      string  `json:"state"`      // StatusContext: SUCCESS, FAILURE, PENDING, etc.
+}
+
+type checkContextsResult struct {
+	Number  int `json:"number"`
+	Commits struct {
+		Nodes []struct {
+			Commit struct {
+				StatusCheckRollup *struct {
+					Contexts struct {
+						Nodes []checkContextNode `json:"nodes"`
+					} `json:"contexts"`
+				} `json:"statusCheckRollup"`
+			} `json:"commit"`
+		} `json:"nodes"`
+	} `json:"commits"`
+}
+
+type graphqlRequest struct {
+	Query string `json:"query"`
+}
+
+type graphqlResponse struct {
+	Data   map[string]json.RawMessage `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
+// fetchRequiredChecksStatus makes a single batched GraphQL query to fetch
+// individual check contexts for all given pull requests. It evaluates only
+// the checks listed in config.Repo.RequiredChecks and returns a map from
+// PR number to the computed status.
+func (c *client) fetchRequiredChecksStatus(ctx context.Context, pullRequests []*github.PullRequest) map[int]github.CheckStatus {
+	if len(pullRequests) == 0 {
+		return nil
+	}
+
+	if c.config.User.LogGitHubCalls {
+		fmt.Printf("> github fetch required check status\n")
+	}
+
+	// Build a single GraphQL query with one aliased field per PR.
+	var queryBuilder strings.Builder
+	queryBuilder.WriteString("query {")
+	for _, pr := range pullRequests {
+		fmt.Fprintf(&queryBuilder, `
+  pr_%d: node(id: %q) {
+    ... on PullRequest {
+      number
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              contexts(first: 100) {
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    name
+                    conclusion
+                    status
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }`, pr.Number, pr.ID)
+	}
+	queryBuilder.WriteString("\n}")
+
+	reqBody, err := json.Marshal(graphqlRequest{
+		Query: queryBuilder.String(),
+	})
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to marshal required checks query")
+		return nil
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.graphqlEndpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to create required checks request")
+		return nil
+	}
+	httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
+	httpReq.Header.Set("Accept", "application/json; charset=utf-8")
+
+	httpResp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to fetch required checks status")
+		return nil
+	}
+	defer httpResp.Body.Close()
+
+	var gqlResp graphqlResponse
+	if err := json.NewDecoder(httpResp.Body).Decode(&gqlResp); err != nil {
+		log.Warn().Err(err).Msg("failed to decode required checks response")
+		return nil
+	}
+	if len(gqlResp.Errors) > 0 {
+		log.Warn().Str("error", gqlResp.Errors[0].Message).Msg("graphql error fetching required checks")
+		return nil
+	}
+
+	// Build the set of required check names from config.
+	requiredSet := make(map[string]bool, len(c.config.Repo.RequiredChecks))
+	for _, name := range c.config.Repo.RequiredChecks {
+		requiredSet[name] = true
+	}
+
+	result := make(map[int]github.CheckStatus)
+	for _, pr := range pullRequests {
+		alias := fmt.Sprintf("pr_%d", pr.Number)
+		raw, ok := gqlResp.Data[alias]
+		if !ok {
+			continue
+		}
+		var prResult checkContextsResult
+		if err := json.Unmarshal(raw, &prResult); err != nil {
+			log.Warn().Err(err).Int("pr", pr.Number).Msg("failed to unmarshal check contexts for PR")
+			continue
+		}
+		if len(prResult.Commits.Nodes) == 0 {
+			continue
+		}
+		commit := prResult.Commits.Nodes[0].Commit
+		if commit.StatusCheckRollup == nil {
+			// No checks configured — treat as pass
+			result[pr.Number] = github.CheckStatusPass
+			continue
+		}
+		result[pr.Number] = computeRequiredCheckStatus(commit.StatusCheckRollup.Contexts.Nodes, requiredSet)
+	}
+
+	return result
+}
+
+// contextName returns the display name for a check context node.
+// For CheckRun nodes this is the Name field; for StatusContext nodes it's the Context field.
+func contextName(ctx checkContextNode) string {
+	if ctx.TypeName == "StatusContext" {
+		return ctx.Context
+	}
+	return ctx.Name
+}
+
+// computeRequiredCheckStatus determines the aggregate check status considering
+// only the checks whose name/context appears in requiredChecks.
+// If a required check hasn't reported yet (not present in contexts), it is
+// treated as pending.
+func computeRequiredCheckStatus(contexts []checkContextNode, requiredChecks map[string]bool) github.CheckStatus {
+	// Track which required checks we've seen
+	seen := make(map[string]bool, len(requiredChecks))
+	hasPending := false
+	hasFail := false
+
+	for _, ctx := range contexts {
+		name := contextName(ctx)
+		if !requiredChecks[name] {
+			continue
+		}
+		seen[name] = true
+
+		switch ctx.TypeName {
+		case "CheckRun":
+			switch ctx.Status {
+			case "COMPLETED":
+				if ctx.Conclusion == nil {
+					hasFail = true
+				} else {
+					switch *ctx.Conclusion {
+					case "SUCCESS", "NEUTRAL", "SKIPPED":
+						// pass
+					default:
+						hasFail = true
+					}
+				}
+			default:
+				// IN_PROGRESS, QUEUED, REQUESTED, WAITING, PENDING
+				hasPending = true
+			}
+		case "StatusContext":
+			switch ctx.State {
+			case "SUCCESS":
+				// pass
+			case "PENDING", "EXPECTED":
+				hasPending = true
+			default:
+				hasFail = true
+			}
+		}
+	}
+
+	// Any required check that hasn't reported yet is pending
+	for name := range requiredChecks {
+		if !seen[name] {
+			hasPending = true
+		}
+	}
+
+	if hasFail {
+		return github.CheckStatusFail
+	}
+	if hasPending {
+		return github.CheckStatusPending
+	}
+	return github.CheckStatusPass
 }
 
 func check(err error) {

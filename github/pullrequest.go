@@ -19,17 +19,19 @@ type PullRequest struct {
 	Title      string
 	Body       string
 
-	MergeStatus PullRequestMergeStatus
-	Merged      bool
-	Commits     []git.Commit
-	InQueue     bool
+	MergeStatus    PullRequestMergeStatus
+	Merged         bool
+	Commits        []git.Commit
+	InQueue        bool
+	LocalCommitHash string
 }
 
-type checkStatus int
+// CheckStatus represents the aggregate status of GitHub checks on a pull request
+type CheckStatus int
 
 const (
 	// CheckStatusUnknown
-	CheckStatusUnknown checkStatus = iota
+	CheckStatusUnknown CheckStatus = iota
 
 	// CheckStatusPending when checks are still running
 	CheckStatusPending
@@ -44,7 +46,7 @@ const (
 // PullRequestMergeStatus is the merge status of a pull request
 type PullRequestMergeStatus struct {
 	// ChecksPass is the status of GitHub checks
-	ChecksPass checkStatus
+	ChecksPass CheckStatus
 
 	// ReviewApproved is true when a pull request is approved by a fellow reviewer
 	ReviewApproved bool
@@ -176,9 +178,26 @@ func (pr *PullRequest) String(config *config.Config) string {
 	}
 
 	prInfo := fmt.Sprintf("%3d", pr.Number)
-	if config.User.ShowPRLink {
-		prInfo = fmt.Sprintf("https://%s/%s/%s/pull/%d",
-			config.Repo.GitHubHost, config.Repo.GitHubRepoOwner, config.Repo.GitHubRepoName, pr.Number)
+	prURL := fmt.Sprintf("https://%s/%s/%s/pull/%d",
+		config.Repo.GitHubHost, config.Repo.GitHubRepoOwner, config.Repo.GitHubRepoName, pr.Number)
+	if config.User.ShortPRLink {
+		// OSC 8 terminal hyperlink: \033]8;;URL\033\\TEXT\033]8;;\033\\
+		prInfo = fmt.Sprintf("\033]8;;%s\033\\PR-%d\033]8;;\033\\", prURL, pr.Number)
+	} else if config.User.ShowPRLink {
+		prInfo = prURL
+	}
+
+	if config.User.ShowCommitID {
+		// Prefer the local commit hash (matches git log) over the remote hash
+		displayHash := pr.LocalCommitHash
+		if displayHash == "" {
+			displayHash = pr.Commit.CommitHash
+		}
+		if len(displayHash) >= 8 {
+			prInfo = displayHash[:8] + " " + prInfo
+		} else if len(displayHash) > 0 {
+			prInfo = displayHash + " " + prInfo
+		}
 	}
 
 	var mq string
@@ -202,6 +221,11 @@ func (pr *PullRequest) String(config *config.Config) string {
 		terminalWidth = 1000
 	}
 	lineLength := utf8.RuneCountInString(line)
+	if config.User.ShortPRLink {
+		// OSC 8 escape sequences are invisible; subtract their length
+		// The escape overhead is: \033]8;; + URL + \033\\ + \033]8;;\033\\ = 12 + len(URL)
+		lineLength -= 12 + utf8.RuneCountInString(prURL)
+	}
 	if config.User.StatusBitsEmojis {
 		// each emoji consumes 2 chars in the terminal
 		lineLength += 4
@@ -214,7 +238,14 @@ func (pr *PullRequest) String(config *config.Config) string {
 	return line
 }
 
-func (cs checkStatus) String(config *config.Config) string {
+// TextString returns a plain text representation of the pull request: "<url> : <title>"
+func (pr *PullRequest) TextString(config *config.Config) string {
+	prURL := fmt.Sprintf("https://%s/%s/%s/pull/%d",
+		config.Repo.GitHubHost, config.Repo.GitHubRepoOwner, config.Repo.GitHubRepoName, pr.Number)
+	return fmt.Sprintf("%s : %s", prURL, pr.Title)
+}
+
+func (cs CheckStatus) String(config *config.Config) string {
 	icons := statusBitIcons(config)
 	if config.Repo.RequireChecks {
 		switch cs {

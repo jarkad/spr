@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,7 +25,6 @@ import (
 
 // NewStackedPR constructs and returns a new stackediff instance.
 func NewStackedPR(config *config.Config, github github.GitHubInterface, gitcmd git.GitInterface) *stackediff {
-
 	return &stackediff{
 		config:       config,
 		github:       github,
@@ -42,6 +42,7 @@ type stackediff struct {
 	gitcmd        git.GitInterface
 	profiletimer  profiletimer.Timer
 	DetailEnabled bool
+	TextEnabled   bool
 
 	output       io.Writer
 	input        io.Reader
@@ -86,8 +87,160 @@ func (sd *stackediff) AmendCommit(ctx context.Context) {
 	sd.gitcmd.MustGit(rebaseCmd, nil)
 }
 
+func (sd *stackediff) editStatePath() string {
+	return filepath.Join(sd.gitcmd.RootDir(), ".git", "spr_edit_state")
+}
+
+func (sd *stackediff) isEditing() bool {
+	_, err := os.Stat(sd.editStatePath())
+	return err == nil
+}
+
+// EditCommit starts an interactive edit session on a commit in the stack.
+//
+//	The user picks a commit, and the tool starts a rebase with an edit stop
+//	at that commit. The user can then edit files and run `git spr edit --done`
+//	to amend and restore the stack.
+func (sd *stackediff) EditCommit(ctx context.Context) {
+	if sd.isEditing() {
+		fmt.Fprintf(sd.output, "Already editing a commit.\n")
+		fmt.Fprintf(sd.output, "Run 'git spr edit --done' to finish or 'git spr edit --abort' to cancel.\n")
+		return
+	}
+
+	localCommits := git.GetLocalCommitStack(sd.config, sd.gitcmd)
+	if len(localCommits) == 0 {
+		fmt.Fprintf(sd.output, "No commits to edit\n")
+		return
+	}
+
+	for i := len(localCommits) - 1; i >= 0; i-- {
+		commit := localCommits[i]
+		fmt.Fprintf(sd.output, " %d : %s : %s\n", i+1, commit.CommitID[0:8], commit.Subject)
+	}
+
+	if len(localCommits) == 1 {
+		fmt.Fprintf(sd.output, "Commit to edit (%d): ", 1)
+	} else {
+		fmt.Fprintf(sd.output, "Commit to edit (%d-%d): ", 1, len(localCommits))
+	}
+
+	reader := bufio.NewReader(sd.input)
+	line, _ := reader.ReadString('\n')
+	line = strings.TrimSpace(line)
+	commitIndex, err := strconv.Atoi(line)
+	if err != nil || commitIndex < 1 || commitIndex > len(localCommits) {
+		fmt.Fprint(sd.output, "Invalid input\n")
+		return
+	}
+	commitIndex = commitIndex - 1
+
+	targetCommit := localCommits[commitIndex]
+
+	// Write state file so --done knows we're in an edit session
+	stateContent := fmt.Sprintf("commit_id=%s\ncommit_subject=%s\n", targetCommit.CommitID, targetCommit.Subject)
+	err = os.WriteFile(sd.editStatePath(), []byte(stateContent), 0644)
+	check(err)
+
+	// Use the spr binary itself as the sequence editor to rewrite 'pick' to 'edit'
+	// for the target commit. Git invokes the editor as: <editor> <todo-file>
+	exe, err := os.Executable()
+	check(err)
+	editorCmd := fmt.Sprintf("%s _edit-sequence %s", exe, targetCommit.CommitHash[:7])
+
+	rebaseCmd := fmt.Sprintf("rebase -i --autostash %s/%s",
+		sd.config.Repo.GitHubRemote, sd.config.Repo.GitHubBranch)
+	err = sd.gitcmd.GitWithEditor(rebaseCmd, nil, editorCmd)
+	if err != nil {
+		// Clean up state file on failure
+		os.Remove(sd.editStatePath())
+		fmt.Fprintf(sd.output, "Failed to start edit session: %s\n", err)
+		return
+	}
+
+	fmt.Fprintf(sd.output, "\nEditing commit %d: %s\n", commitIndex+1, targetCommit.Subject)
+	fmt.Fprintf(sd.output, "Make your changes, then run: git spr edit --done\n")
+	fmt.Fprintf(sd.output, "To cancel, run: git spr edit --abort\n")
+}
+
+// EditCommitDone finishes an edit session by amending the current commit
+//
+//	and continuing the rebase to restore the full stack.
+func (sd *stackediff) EditCommitDone(ctx context.Context, update bool) {
+	if !sd.isEditing() {
+		fmt.Fprintf(sd.output, "No edit session in progress.\n")
+		return
+	}
+
+	// Stage modifications and deletions to tracked files only.
+	// Using -u instead of -A avoids accidentally staging untracked files.
+	sd.gitcmd.MustGit("add -u", nil)
+
+	// Check if we're resolving a rebase conflict or at the initial edit stop.
+	// Git creates .git/REBASE_HEAD when a rebase stops due to a conflict,
+	// but NOT when it stops at an 'edit' point.
+	rebaseHeadPath := filepath.Join(sd.gitcmd.RootDir(), ".git", "REBASE_HEAD")
+	_, rebaseHeadErr := os.Stat(rebaseHeadPath)
+	isConflictResolution := rebaseHeadErr == nil
+
+	if isConflictResolution {
+		// We're resolving a conflict that occurred while replaying commits
+		// above the edited commit. Just continue the rebase — git will
+		// create the proper commit from the staged conflict resolution.
+		// Do NOT amend here, as that would squash this commit's changes
+		// into the previous commit.
+		err := sd.gitcmd.Git("rebase --continue", nil)
+		if err != nil {
+			fmt.Fprintf(sd.output, "Rebase conflict detected. Resolve conflicts and run 'git spr edit --done' again.\n")
+			return
+		}
+	} else {
+		// We're at the initial edit stop. Amend the target commit with
+		// the user's changes, then continue the rebase to replay the
+		// remaining commits on top.
+		err := sd.gitcmd.Git("commit --amend --no-edit", nil)
+		if err != nil {
+			fmt.Fprintf(sd.output, "Failed to amend commit: %s\n", err)
+			fmt.Fprintf(sd.output, "Resolve any issues and try again.\n")
+			return
+		}
+
+		err = sd.gitcmd.Git("rebase --continue", nil)
+		if err != nil {
+			fmt.Fprintf(sd.output, "Rebase conflict detected. Resolve conflicts and run 'git spr edit --done' again.\n")
+			return
+		}
+	}
+
+	// Clean up state file
+	os.Remove(sd.editStatePath())
+	fmt.Fprintf(sd.output, "Stack restored successfully.\n")
+
+	if update {
+		sd.UpdatePullRequests(ctx, nil, nil)
+	}
+}
+
+// EditCommitAbort aborts the current edit session and restores the original stack.
+func (sd *stackediff) EditCommitAbort(ctx context.Context) {
+	if !sd.isEditing() {
+		fmt.Fprintf(sd.output, "No edit session in progress.\n")
+		return
+	}
+
+	err := sd.gitcmd.Git("rebase --abort", nil)
+	if err != nil {
+		fmt.Fprintf(sd.output, "Failed to abort: %s\n", err)
+		return
+	}
+
+	os.Remove(sd.editStatePath())
+	fmt.Fprintf(sd.output, "Edit session aborted.\n")
+}
+
 func (sd *stackediff) addReviewers(ctx context.Context,
-	pr *github.PullRequest, reviewers []string, assignable []github.RepoAssignee) {
+	pr *github.PullRequest, reviewers []string, assignable []github.RepoAssignee,
+) {
 	userIDs := make([]string, 0, len(reviewers))
 	for _, r := range reviewers {
 		found := false
@@ -106,7 +259,7 @@ func (sd *stackediff) addReviewers(ctx context.Context,
 }
 
 func alignLocalCommits(commits []git.Commit, prs []*github.PullRequest) []git.Commit {
-	var remoteCommits = map[string]bool{}
+	remoteCommits := map[string]bool{}
 	for _, pr := range prs {
 		for _, c := range pr.Commits {
 			remoteCommits[c.CommitID] = c.CommitID == pr.Commit.CommitID
@@ -135,6 +288,7 @@ func alignLocalCommits(commits []git.Commit, prs []*github.PullRequest) []git.Co
 //	 will also be reordered to match the commit stack order.
 func (sd *stackediff) UpdatePullRequests(ctx context.Context, reviewers []string, count *uint) {
 	sd.profiletimer.Step("UpdatePullRequests::Start")
+	reviewers = append(sd.config.Repo.DefaultReviewers, reviewers...)
 	githubInfo := sd.fetchAndGetGitHubInfo(ctx)
 	if githubInfo == nil {
 		return
@@ -169,7 +323,7 @@ func (sd *stackediff) UpdatePullRequests(ctx context.Context, reviewers []string
 		for i := range githubInfo.PullRequests {
 			fn := func(i int) {
 				pr := githubInfo.PullRequests[i]
-				sd.github.UpdatePullRequest(ctx, sd.gitcmd, githubInfo.PullRequests, pr, pr.Commit, nil)
+				sd.github.UpdatePullRequest(ctx, sd.gitcmd, githubInfo, githubInfo.PullRequests, pr, pr.Commit, nil)
 				wg.Done()
 			}
 			if sd.synchronized {
@@ -245,7 +399,7 @@ func (sd *stackediff) UpdatePullRequests(ctx context.Context, reviewers []string
 	for i := range updateQueue {
 		fn := func(i int) {
 			pr := updateQueue[i]
-			sd.github.UpdatePullRequest(ctx, sd.gitcmd, sortedPullRequests, pr.pr, pr.commit, pr.prevCommit)
+			sd.github.UpdatePullRequest(ctx, sd.gitcmd, githubInfo, sortedPullRequests, pr.pr, pr.commit, pr.prevCommit)
 			wg.Done()
 		}
 		if sd.synchronized {
@@ -316,12 +470,13 @@ func (sd *stackediff) MergePullRequests(ctx context.Context, count *uint) {
 		prIndex--
 	}
 	if prIndex == -1 {
+		check(errors.New("no mergeable pull requests found in the stack"))
 		return
 	}
 	prToMerge := githubInfo.PullRequests[prIndex]
 
 	// Update the base of the merging pr to target branch
-	sd.github.UpdatePullRequest(ctx, sd.gitcmd, githubInfo.PullRequests, prToMerge, prToMerge.Commit, nil)
+	sd.github.UpdatePullRequest(ctx, sd.gitcmd, githubInfo, githubInfo.PullRequests, prToMerge, prToMerge.Commit, nil)
 	sd.profiletimer.Step("MergePullRequests::update pr base")
 
 	// Merge pull request
@@ -329,7 +484,7 @@ func (sd *stackediff) MergePullRequests(ctx context.Context, count *uint) {
 	check(err)
 	sd.github.MergePullRequest(ctx, prToMerge, mergeMethod)
 	if sd.config.User.DeleteMergedBranches {
-		git.DeleteRemoteBranch(sd.config, sd.gitcmd, prToMerge.FromBranch)
+		sd.gitcmd.DeleteRemoteBranch(ctx, prToMerge.FromBranch)
 	}
 
 	// Close all the pull requests in the stack below the merged pr
@@ -342,7 +497,7 @@ func (sd *stackediff) MergePullRequests(ctx context.Context, count *uint) {
 		sd.github.CommentPullRequest(ctx, pr, comment)
 		sd.github.ClosePullRequest(ctx, pr)
 		if sd.config.User.DeleteMergedBranches {
-			git.DeleteRemoteBranch(sd.config, sd.gitcmd, pr.FromBranch)
+			sd.gitcmd.DeleteRemoteBranch(ctx, pr.FromBranch)
 		}
 	}
 	sd.profiletimer.Step("MergePullRequests::close prs")
@@ -364,7 +519,12 @@ func (sd *stackediff) StatusPullRequests(ctx context.Context) {
 	sd.profiletimer.Step("StatusPullRequests::Start")
 	githubInfo := sd.github.GetInfo(ctx, sd.gitcmd)
 
-	if len(githubInfo.PullRequests) == 0 {
+	if sd.TextEnabled {
+		for i := len(githubInfo.PullRequests) - 1; i >= 0; i-- {
+			pr := githubInfo.PullRequests[i]
+			fmt.Fprintf(sd.output, "%s\n", pr.TextString(sd.config))
+		}
+	} else if len(githubInfo.PullRequests) == 0 {
 		fmt.Fprintf(sd.output, "pull request stack is empty\n")
 	} else {
 		if sd.DetailEnabled {
@@ -440,7 +600,6 @@ func (sd *stackediff) RunMergeCheck(ctx context.Context) {
 	}()
 
 	err = cmd.Wait()
-
 	if err != nil {
 		sd.config.State.MergeCheckCommit[githubInfo.Key()] = ""
 		rake.LoadSources(sd.config.State,
@@ -504,7 +663,7 @@ func (sd *stackediff) fetchAndGetGitHubInfo(ctx context.Context) *github.GitHubI
 		return nil
 	}
 	info := sd.github.GetInfo(ctx, sd.gitcmd)
-	if git.BranchNameRegex.FindString(info.LocalBranch) != "" {
+	if git.BranchNameRegex(sd.config.User.BranchPrefix).FindString(info.LocalBranch) != "" {
 		fmt.Printf("error: don't run spr in a remote pr branch\n")
 		fmt.Printf(" this could lead to weird duplicate pull requests getting created\n")
 		fmt.Printf(" in general there is no need to checkout remote branches used for prs\n")
@@ -522,8 +681,8 @@ func (sd *stackediff) fetchAndGetGitHubInfo(ctx context.Context) *github.GitHubI
 //	which are new (on top of remote branch) and creates a corresponding
 //	branch on github for each commit.
 func (sd *stackediff) syncCommitStackToGitHub(ctx context.Context,
-	commits []git.Commit, info *github.GitHubInfo) bool {
-
+	commits []git.Commit, info *github.GitHubInfo,
+) bool {
 	var output string
 	sd.gitcmd.MustGit("status --porcelain --untracked-files=no", &output)
 	if output != "" {

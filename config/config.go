@@ -23,12 +23,15 @@ type RepoConfig struct {
 	GitHubRemote string `default:"origin" yaml:"githubRemote"`
 	GitHubBranch string `default:"main" yaml:"githubBranch"`
 
-	RequireChecks   bool `default:"true" yaml:"requireChecks"`
-	RequireApproval bool `default:"true" yaml:"requireApproval"`
+	RequireChecks    bool     `default:"true" yaml:"requireChecks"`
+	RequiredChecks   []string `yaml:"requiredChecks"`
+	RequireApproval  bool     `default:"true" yaml:"requireApproval"`
+	DefaultReviewers []string `yaml:"defaultReviewers"`
 
 	MergeMethod string `default:"rebase" yaml:"mergeMethod"`
 	MergeQueue  bool   `default:"false" yaml:"mergeQueue"`
 
+	PRTemplateType        string `default:"stack" yaml:"prTemplateType"`
 	PRTemplatePath        string `yaml:"prTemplatePath,omitempty"`
 	PRTemplateInsertStart string `yaml:"prTemplateInsertStart,omitempty"`
 	PRTemplateInsertEnd   string `yaml:"prTemplateInsertEnd,omitempty"`
@@ -51,7 +54,11 @@ type UserConfig struct {
 	CreateDraftPRs       bool `default:"false" yaml:"createDraftPRs"`
 	PreserveTitleAndBody bool `default:"false" yaml:"preserveTitleAndBody"`
 	NoRebase             bool `default:"false" yaml:"noRebase"`
+	NoFetch              bool `default:"false" yaml:"noFetch"`
 	DeleteMergedBranches bool `default:"false" yaml:"deleteMergedBranches"`
+	ShortPRLink          bool `default:"false" yaml:"shortPRLink"`
+	ShowCommitID         bool `default:"false" yaml:"showCommitID"`
+	BranchPrefix         string `default:"spr" yaml:"branchPrefix"`
 }
 
 type InternalState struct {
@@ -82,7 +89,19 @@ func DefaultConfig() *Config {
 
 	cfg.User.LogGitCommands = false
 	cfg.User.LogGitHubCalls = false
+
+	// Normalize config (e.g., set PRTemplateType to "custom" if PRTemplatePath is provided)
+	cfg.Normalize()
+
 	return cfg
+}
+
+// Normalize applies normalization rules to the config
+// For example, if PRTemplatePath is provided, PRTemplateType should be set to "custom"
+func (c *Config) Normalize() {
+	if c.Repo != nil && c.Repo.PRTemplatePath != "" {
+		c.Repo.PRTemplateType = "custom"
+	}
 }
 
 func (c Config) MergeMethod() (genclient.PullRequestMergeMethod, error) {
